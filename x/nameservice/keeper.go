@@ -15,7 +15,7 @@ package nameservice
    "github.com/cosmos/cosmos-sdk/codec"
    "github.com/cosmos/cosmos-sdk/x/bank"
 
-   sdk "github.com/cosmosc/cosmos-sdk/types"
+   sdk "github.com/cosmos/cosmos-sdk/types"
 
 )
 
@@ -230,10 +230,6 @@ Notes on code above:
 
 // Next => describe how users interact with store using Msgs and Handlers
 
-
-
-
-*/
 
 
 
