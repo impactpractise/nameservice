@@ -1,15 +1,27 @@
 //in app.go we define what the application does once it receives a transaction
 
 //To receive transactions in correct order we use the Tendermint consensus engine
-
 package app
 
 import (
-  "github.com/tendermint/tendermint/libs/log"
-    "github.com/cosmos/cosmos-sdk/x/auth")
+  "encoding/json"
 
-    bam "github.com/cosmos/cosmos-sdk/baseapp"
-    dbm "hithub.com/tendermint/tendermint/libs/db"
+  "github.com/tendermint/tendermint/libs/log"
+
+  "github.com/cosmos/cosmos-sdk/codec"
+  "github.com/cosmos/cosmos-sdk/x/auth"
+  "github.com/cosmos/cosmos-sdk/x/bank"
+  "github.com/cosmos/cosmos-sdk/x/stake"
+  "github.com/cosmos/sdk-application-tutorial/x/nameservice"
+
+  bam "github.com/cosmos/cosmos-sdk/baseapp"
+  sdk "github.com/cosmos/cosmos-sdk/types"
+  abci "github.com/tendermint/tendermint/abci/types"
+  cmn "github.com/tendermint/tendermint/libs/common"
+  dbm "github.com/tendermint/tendermint/libs/db"
+  tmtypes "github.com/tendermint/tendermint/types"
+)
+
 
 /*links to godocs for each module and package imported:
 
@@ -46,34 +58,6 @@ The achitecture of the blockchain node we are building looks like the following:
 
 The Cosmos SDK provides a boilerplate implementation of the ABCI interface the form of baseapp
 
-Here is what baseapp does:
-
-- Decode transactions received from the Tendermint consensus engine.
-
-- Extract messages from transactions and do basic sanity checks.
-
-- Route the message to the appropriate module so that in can be processed. Note that baseapp
-  has no knowledge of the specific modules we want to use. It is our job to declare such modules
-  in app.go, as we will see soon.
-  baseapp implements the core routing logic that can be applied to any module.
-
-- Commit if the ABCI message is DeliverTx (CheckTx changes are not persistent).
-
-- Help setup BEGINBLOCK and ENDBLOCK, two messages that enables us to define logic executed
-  at the beginning and end of each block.
-  In Practice, each module implements its own Beginblock and Endblock sub-logic,
-  and the role of the app is to aggregate everything together
-
-- Help Initialise our state
-
-- Help set up queries.
-
-
-Now we are going to create the skeleton of our a custom type nameserviceApp application.
-
-This type will embed baseapp (embedding in Go is similar to inheritance in other languages),
-meaning it will have access to all of baseapps methods.
-
 */
 
 
@@ -83,39 +67,143 @@ const (
 
 type nameserviceApp struct {
   *bam.BaseApp
+  cdc *codec.Codec
+
+  keyMain          *sdk.KVStoreKey
+  keyAccount       *sdk.KVStoreKey
+  keyNSnames       *sdk.KVStoreKey
+  keyNSowners      *sdk.KVStoreKey
+  keyNSprices      *sdk.KVStoreKey
+  keyFeeCollection *sdk.KVStoreKey
+
+  accountKeeper       auth.AccountKeeper
+  bankKeeper          bank.Keeper
+  feeCollectionKeeper auth.FeeCollectionKeeper
+  nsKeeper            nameservice.Keeper
 }
 
-// lets add a simple constructor for our application
+}
 
-func NewnameserviceApp(logger log.logger, db dbm.DB) *nameserviceApp{
+func NewnameserviceApp(logger log.Logger, db dbm.DB) *nameserviceApp {
 
-  //First we define the top level codec that will be shared by the different modules
+  // First define the top level codec that will be shared by the different modules
   cdc := MakeCodec()
 
-  //BaseApp handles interations with Tendermint through the ABCI protocol
+  // BaseApp handles interactions with Tendermint through the ABCI protocol
   bApp := bam.NewBaseApp(appName, logger, db, auth.DefaultTxDecoder(cdc))
 
+  // Here you initialize your application with the store keys it requires
   var app = &nameserviceApp{
     BaseApp: bApp,
-    cdc:      cdc,
+    cdc:     cdc,
+
+    keyMain:          sdk.NewKVStoreKey("main"),
+    keyAccount:       sdk.NewKVStoreKey("acc"),
+    keyNSnames:       sdk.NewKVStoreKey("ns_names"),
+    keyNSowners:      sdk.NewKVStoreKey("ns_owners"),
+    keyNSprices:      sdk.NewKVStoreKey("ns_prices"),
+    keyFeeCollection: sdk.NewKVStoreKey("fee_collection"),
+  }
+
+  // The AccountKeeper handles address -> account lookups
+  app.accountKeeper = auth.NewAccountKeeper(
+    app.cdc,
+    app.keyAccount,
+    auth.ProtoBaseAccount,
+  )
+
+  // The BankKeeper allows you perform sdk.Coins interactions
+  app.bankKeeper = bank.NewBaseKeeper(app.accountKeeper)
+
+  // The FeeCollectionKeeper collects transaction fees and renders them to the fee distribution module
+  app.feeCollectionKeeper = auth.NewFeeCollectionKeeper(cdc, app.keyFeeCollection)
+
+  // The NameserviceKeeper is the Keeper from the module for this tutorial
+  // It handles interactions with the namestore
+  app.nsKeeper = nameservice.NewKeeper(
+    app.bankKeeper,
+    app.keyNSnames,
+    app.keyNSowners,
+    app.keyNSprices,
+    app.cdc,
+  )
+
+  // The AnteHandler handles signature verification and transaction pre-processing
+  app.SetAnteHandler(auth.NewAnteHandler(app.accountKeeper, app.feeCollectionKeeper))
+
+  // The app.Router is the main transaction router where each module registers its routes
+  // Register the bank and nameservice routes here
+  app.Router().
+    AddRoute("bank", bank.NewHandler(app.bankKeeper)).
+    AddRoute("nameservice", nameservice.NewHandler(app.nsKeeper))
+
+  // The app.QueryRouter is the main query router where each module registers its routes
+  app.QueryRouter().
+    AddRoute("nameservice", nameservice.NewQuerier(app.nsKeeper))
+
+  // The initChainer handles translating the genesis.json file into initial state for the network
+  app.SetInitChainer(app.initChainer)
+
+  app.MountStores(
+    app.keyMain,
+    app.keyAccount,
+    app.keyNSnames,
+    app.keyNSowners,
+    app.keyNSprices,
+  )
+
+  err := app.LoadLatestVersion(app.keyMain)
+  if err != nil {
+    cmn.Exit(err.Error())
   }
 
   return app
 }
 
-/* Cool, we have a basic skeleton, yet it still lacks functionality.
+// GenesisState represents chain state at the start of the chain. Any initial state (account balances) are stored here.
+type GenesisState struct {
+  Accounts []*auth.BaseAccount `json:"accounts"`
+}
 
-- baseapp has no knowledge of the routes or user interactions we want to use in our application.
-  Main roles of app:
-  define routes
-  define initial state
+func (app *nameserviceApp) initChainer(ctx sdk.Context, req abci.RequestInitChain) abci.ResponseInitChain {
+  stateJSON := req.AppStateBytes
 
-  Both require that we add modules to our application.
+  genesisState := new(GenesisState)
+  err := app.cdc.UnmarshalJSON(stateJSON, genesisState)
+  if err != nil {
+    panic(err)
+  }
 
-  For our nameservice app, we need three modules:
-  -Auth
-  -Bank
-  -nameservice
+  for _, acc := range genesisState.Accounts {
+    acc.AccountNumber = app.accountKeeper.GetNextAccountNumber(ctx)
+    app.accountKeeper.SetAccount(ctx, acc)
+  }
 
-  The first are provided by the SDK. Lets build the nameservice module
-  and define the bulk of our state machine.
+  return abci.ResponseInitChain{}
+}
+
+// ExportAppStateAndValidators does the things
+func (app *nameserviceApp) ExportAppStateAndValidators() (appState json.RawMessage, validators []tmtypes.GenesisValidator, err error) {
+  ctx := app.NewContext(true, abci.Header{})
+  accounts := []*auth.BaseAccount{}
+
+  appendAccountsFn := func(acc auth.Account) bool {
+    account := &auth.BaseAccount{
+      Address: acc.GetAddress(),
+      Coins:   acc.GetCoins(),
+    }
+
+    accounts = append(accounts, account)
+    return false
+  }
+
+  app.accountKeeper.IterateAccounts(ctx, appendAccountsFn)
+
+  genState := GenesisState{Accounts: accounts}
+  appState, err = codec.MarshalJSONIndent(app.cdc, genState)
+  if err != nil {
+    return nil, nil, err
+  }
+
+  return appState, validators, err
+}
